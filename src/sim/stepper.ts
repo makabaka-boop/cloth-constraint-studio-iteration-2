@@ -69,6 +69,8 @@ export function cloneState(state: ClothState): ClothState {
     prev: new Float64Array(state.prev),
     pinned: new Uint8Array(state.pinned),
     torn: new Uint8Array(state.torn),
+    // 缝线只追加、字段为标量，逐对象拷贝即可保留全部代次的取证轨迹。
+    stitches: state.stitches.map((st) => ({ ...st })),
     step: state.step,
   };
 }

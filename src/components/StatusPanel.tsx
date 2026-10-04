@@ -35,6 +35,7 @@ export function StatusPanel({ snapshot, hoveredNode, report, busy, onRunChecks }
             <Stat label="步数" value={`${snapshot.step} / ${MAX_STEPS}`} />
             <Stat label="固定点" value={snapshot.pinnedCount} />
             <Stat label="撕裂边" value={snapshot.tornCount} />
+            <Stat label="缝线(活动/总)" value={`${snapshot.activeStitchCount} / ${snapshot.stitchCount}`} />
             <Stat label="操作数" value={snapshot.ops.length} />
           </div>
           <div className="progress">
@@ -57,6 +58,28 @@ export function StatusPanel({ snapshot, hoveredNode, report, busy, onRunChecks }
             </table>
           ) : (
             <p className="hint">将鼠标悬停到任意节点上查看其逐帧状态。</p>
+          )}
+
+          <h4>补缝缝线（含代次）</h4>
+          {snapshot.stitches.length === 0 ? (
+            <p className="hint">尚无补缝。点击画面上的红色虚线撕裂边即可在当前步补缝。</p>
+          ) : (
+            <table className="kv">
+              <thead>
+                <tr><th>缝线 id</th><th>代次</th><th>端点</th><th>状态</th><th>生效/撕裂步</th></tr>
+              </thead>
+              <tbody>
+                {snapshot.stitches.map((st) => (
+                  <tr key={st.id}>
+                    <td>#{st.id}</td>
+                    <td>第 {st.generation} 代</td>
+                    <td>{st.a}–{st.b}</td>
+                    <td>{st.torn ? '已再撕裂' : `活动(${fmt(st.strain ?? 1)}×)`}</td>
+                    <td>{st.appliedStep}{st.tornStep !== null ? ` → ${st.tornStep}` : ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           )}
 
           <h4>自动化不变量核对</h4>
@@ -88,6 +111,7 @@ const LABELS: Record<string, string> = {
   fixedNoDrift: '固定点不漂移',
   ground: '地面边界',
   tearMonotonic: '撕裂不可逆',
+  stitchIntegrity: '补缝完整性',
   determinism: '分批推进一致',
   pinSemantics: '固定/释放语义',
   cap: '600 步上限',

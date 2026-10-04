@@ -75,6 +75,15 @@ input[type='number'], select {
 
 .stage { display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .legend { font-size: 12px; color: #8b93ad; text-align: center; margin: 0; }
+.mend-notice {
+  margin: 0;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  text-align: center;
+}
+.mend-notice.ok { color: #8fd9a4; background: rgba(84,170,110,0.12); border: 1px solid #3f7a52; }
+.mend-notice.bad { color: #f2a0a0; background: rgba(210,80,80,0.12); border: 1px solid #8c4040; }
 .dot {
   display: inline-block;
   width: 8px;
@@ -85,7 +94,7 @@ input[type='number'], select {
 .dot.pin { background: #ffd166; }
 .dot.free { background: #9fb4e8; }
 
-.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.stat-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
 .stat {
   background: #0d1120;
   border: 1px solid #26304d;
@@ -108,6 +117,7 @@ input[type='number'], select {
 .kv { width: 100%; border-collapse: collapse; font-size: 12px; }
 .kv td { padding: 3px 6px; border-bottom: 1px solid #202840; }
 .kv td:first-child { color: #8b93ad; width: 45%; }
+.kv th { padding: 3px 6px; color: #8b93ad; font-weight: 500; text-align: left; border-bottom: 1px solid #2c3656; }
 
 .report {
   margin-top: 10px;

@@ -4,10 +4,11 @@ import {
   createClothModel,
   createInitialState,
   applyOpsAtStep,
+  prepareMendOp,
 } from '../sim/cloth';
 import { buildSnapshot } from '../sim/snapshot';
 import { Stepper } from '../sim/stepper';
-import { MAX_STEPS, type ClothConfig, type ClothOp, type MovePoint } from '../sim/types';
+import { MAX_STEPS, type ClothConfig, type ClothOp, type MendRejectReason, type MovePoint } from '../sim/types';
 import type { WorkerRequest, WorkerResponse } from './protocol';
 
 /**
@@ -94,7 +95,7 @@ function handle(msg: WorkerRequest): void {
       if (!stepper) return;
       stepper.ops.push(...msg.newOps);
       // 暂停时追加：在「当前步」立即生效一次（同一 op 在将来推进时幂等重放）。
-      applyOpsAtStep(stepper.state, stepper.ops);
+      applyOpsAtStep(stepper.state, stepper.ops, stepper.model);
       send({ type: 'snapshot', epoch, snapshot: currentSnapshot() });
       return;
     }
@@ -103,7 +104,7 @@ function handle(msg: WorkerRequest): void {
       const op = findActiveMove(stepper.ops, msg.node);
       if (op && op.kind === 'move') {
         mergePoints(op.points, msg.points);
-        applyOpsAtStep(stepper.state, stepper.ops);
+        applyOpsAtStep(stepper.state, stepper.ops, stepper.model);
       }
       send({ type: 'snapshot', epoch, snapshot: currentSnapshot() });
       return;
@@ -116,9 +117,28 @@ function handle(msg: WorkerRequest): void {
         op.releasePinned = msg.releasePinned;
         if (msg.point) mergePoints(op.points, [msg.point]);
         // 在释放步立刻应用释放语义（暂停状态下也能看到正确的固定态）。
-        applyOpsAtStep(stepper.state, stepper.ops);
+        applyOpsAtStep(stepper.state, stepper.ops, stepper.model);
       }
       send({ type: 'snapshot', epoch, snapshot: currentSnapshot() });
+      return;
+    }
+    case 'mend': {
+      if (!stepper) return;
+      // 在当前已提交步上校验并测量静长。被拒绝时：不动状态、不写日志，原样回帧。
+      const result = prepareMendOp(stepper.model, stepper.state, msg.a, msg.b);
+      if (!result.ok || !result.op) {
+        send({
+          type: 'snapshot',
+          epoch,
+          snapshot: currentSnapshot(),
+          mend: { ok: false, reason: (result.reason ?? 'badEndpoint') as MendRejectReason },
+        });
+        return;
+      }
+      // 通过：追加日志并在「下一次积分之前」于当前步立即生效一次（之后幂等重放）。
+      stepper.ops.push(result.op);
+      applyOpsAtStep(stepper.state, stepper.ops, stepper.model);
+      send({ type: 'snapshot', epoch, snapshot: currentSnapshot(), mend: { ok: true } });
       return;
     }
     case 'check': {

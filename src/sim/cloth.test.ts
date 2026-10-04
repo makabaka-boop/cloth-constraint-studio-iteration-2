@@ -3,6 +3,8 @@ import {
   applyOpsAtStep,
   createClothModel,
   createInitialState,
+  findOriginalEdge,
+  prepareMendOp,
   stepOnce,
   DEFAULT_CONFIG,
 } from './cloth';
@@ -300,5 +302,388 @@ describe('600 步上限', () => {
     expect(snap.nodes.length).toBe(config.cols * config.rows);
     expect(snap.nodes[0].vx).toBe(0);
     expect(snap.nodes[0].vy).toBe(0);
+  });
+});
+
+/**
+ * 撕裂一条垂直边：gravity=0、tearFactor=1.8，把 b=(1,0) 钉到 a=(0,0) 正下方
+ * 3 倍间距处，推进一步使该边撕裂（a 为顶排挂点，天然固定）。
+ * 返回 { edge, a, b, config, model, state }。
+ */
+function tearAway(over: Partial<ClothConfig> = {}) {
+  const { config, model, state } = setup({ gravity: 0, tearFactor: 1.8, ...over });
+  const cols = config.cols;
+  const rows = config.rows;
+  const a = nodeId(0, 0, cols);
+  const b = nodeId(1, 0, cols);
+  const edge = findOriginalEdge(model, a, b);
+  expect(edge).toBe(rows * (cols - 1)); // 垂直段首条：列 0 第 0 条
+  state.pinned[b] = 1; // a 顶排本就固定
+  place(state, b, config.originX, config.originY + config.spacing * 3);
+  stepOnce(config, model, state, []);
+  expect(state.torn[edge]).toBe(1);
+  return { config, model, state, edge, a, b };
+}
+
+function nodeId(r: number, c: number, cols: number): number {
+  return r * cols + c;
+}
+
+function place(state: ReturnType<typeof setup>['state'], node: number, x: number, y: number) {
+  state.pos[node * 2] = x;
+  state.pos[node * 2 + 1] = y;
+  state.prev[node * 2] = x;
+  state.prev[node * 2 + 1] = y;
+}
+
+/** 在当前步对 (a,b) 补缝并立即生效（模拟 Worker mend 路径），返回日志 op。 */
+function mendNow(
+  model: ClothModel,
+  state: ReturnType<typeof setup>['state'],
+  ops: ClothOp[],
+  a: number,
+  b: number,
+): Extract<ClothOp, { kind: 'mend' }> {
+  const result = prepareMendOp(model, state, a, b);
+  expect(result.ok).toBe(true);
+  const op = result.op!;
+  ops.push(op);
+  applyOpsAtStep(state, ops, model);
+  return op;
+}
+
+
+/**
+ * 隔离 b：把 b 的其余两条邻边（水平 (1,0)-(1,1) 与垂直 (1,0)-(2,0)）预先撕掉，
+ * 使 b 只通过 (a,b) 一条约束与布料相连 —— 这样它的补缝力学只由缝线决定。
+ * 调用时机：原边已撕裂、b 仍钉在远点（a、b 都固定，距离精确已知）。
+ */
+function isolateB(
+  config: ClothConfig,
+  model: ClothModel,
+  state: ReturnType<typeof setup>['state'],
+  b: number,
+) {
+  const cols = config.cols;
+  const horiz = findOriginalEdge(model, b, b + 1)!; // (1,0)-(1,1)
+  const vert = findOriginalEdge(model, b, b + cols)!; // (1,0)-(2,0)
+  state.torn[horiz] = 1;
+  state.torn[vert] = 1;
+}
+
+describe('补缝：撕裂 → 新身份缝线', () => {
+  it('在已撕裂边两端生成缝线：静长=生效时实际距离，旧边保持 torn', () => {
+    const { config, model, state, edge, a, b } = tearAway();
+    const ops: ClothOp[] = [];
+    const expectedRest = config.spacing * 3;
+
+    const op = mendNow(model, state, ops, a, b);
+    expect(op.stitchId).toBe(0);
+    expect(op.applyStep).toBe(1);
+    expect(op.restLength).toBe(expectedRest);
+
+    expect(state.stitches).toHaveLength(1);
+    const st = state.stitches[0];
+    expect(st).toMatchObject({
+      id: 0, a, b, restLength: expectedRest, torn: 0, appliedStep: 1, tornStep: -1,
+    });
+    // 旧边仍保持 torn —— 历史不可倒改。
+    expect(state.torn[edge]).toBe(1);
+
+    // b 已与其余邻边隔离，释放后只受缝线约束：无重力下必须停在缝线静长上。
+    isolateB(config, model, state, b);
+    state.pinned[b] = 0;
+    for (let k = 0; k < 30; k++) stepOnce(config, model, state, ops);
+
+    const dist = Math.hypot(
+      state.pos[b * 2] - state.pos[a * 2],
+      state.pos[b * 2 + 1] - state.pos[a * 2 + 1],
+    );
+    expect(dist).toBeCloseTo(expectedRest, 9); // 刚度 1 × 4 次迭代：逐位收敛
+    expect(state.stitches[0].torn).toBe(0);
+    expect(state.torn[edge]).toBe(1); // 旧边依旧未复原
+  });
+
+  it('快照含缝线代次：Canvas/检查/JSON 导出读同一份 stitches', () => {
+    const { config, model, state, a, b } = tearAway();
+    const ops: ClothOp[] = [];
+    mendNow(model, state, ops, a, b);
+    const snap = buildSnapshot(config, model, state, ops);
+    expect(snap.stitchCount).toBe(1);
+    expect(snap.activeStitchCount).toBe(1);
+    expect(snap.stitches).toHaveLength(1);
+    expect(snap.stitches[0]).toMatchObject({
+      id: 0,
+      generation: 1,
+      a,
+      b,
+      restLength: config.spacing * 3,
+      torn: false,
+      appliedStep: 1,
+      tornStep: null,
+    });
+    // JSON 导出（序列化往返）保留缝线与代次字段。
+    const parsed = JSON.parse(JSON.stringify(snap));
+    expect(parsed.stitches[0].generation).toBe(1);
+    expect(parsed.stitches[0].id).toBe(0);
+    expect(parsed.activeStitchCount).toBe(1);
+  });
+
+  it('稳定的约束扫描位置：缝线在水平/垂直边之后按 id 追加，活动缝线不扰动旧边求值', () => {
+    // 两条路径初始状态逐位相同；base 多一条活动缝线，但 b 始终固定，
+    // 因此缝线不产生任何位置修正 —— 两条路径所有节点、旧边撕裂态必须完全相同。
+    const base = tearAway();
+    const ref = tearAway();
+    const ops: ClothOp[] = [];
+    mendNow(base.model, base.state, ops, base.a, base.b); // b 仍钉住，缝线存在但惰性
+    expect(base.state.pinned[base.b]).toBe(1);
+    for (let k = 0; k < 53; k++) {
+      stepOnce(base.config, base.model, base.state, ops);
+      stepOnce(ref.config, ref.model, ref.state, []);
+    }
+    expect(Array.from(base.state.pos)).toEqual(Array.from(ref.state.pos));
+    expect(Array.from(base.state.prev)).toEqual(Array.from(ref.state.prev));
+    expect(Array.from(base.state.torn)).toEqual(Array.from(ref.state.torn));
+    expect(base.state.step).toBe(ref.state.step);
+  });
+});
+
+describe('补缝：再次撕裂与再次补缝（新身份）', () => {
+  it('缝线以后仍按 tearFactor 阈值断裂；断裂只动缝线，旧边仍 torn；可再补出新一代', () => {
+    const { config, model, state, edge, a, b } = tearAway();
+    const ops: ClothOp[] = [];
+    mendNow(model, state, ops, a, b); // 第 1 代：静长 3s
+
+    // b 已钉在 3s 处；再移到 9s（3 倍缝线静长 > 2.5），下一步缝线断裂，原始边依旧 torn。
+    place(state, b, config.originX, config.originY + config.spacing * 9);
+    state.step = 2;
+    stepOnce(config, model, state, ops);
+    expect(state.step).toBe(3);
+    expect(state.stitches[0].torn).toBe(1);
+    expect(state.stitches[0].tornStep).toBe(2);
+    expect(state.torn[edge]).toBe(1);
+
+    // 再次补缝：必须是新身份（id=1，第 2 代），旧缝线记录保留。
+    const result2 = prepareMendOp(model, state, a, b);
+    expect(result2.ok).toBe(true);
+    expect(result2.op!.stitchId).toBe(1);
+    expect(result2.op!.restLength).toBe(config.spacing * 9);
+    expect(result2.op!.applyStep).toBe(3);
+    ops.push(result2.op!);
+    applyOpsAtStep(state, ops, model);
+
+    expect(state.stitches).toHaveLength(2);
+    expect(state.stitches[0]).toMatchObject({ id: 0, torn: 1, tornStep: 2, restLength: config.spacing * 3 });
+    expect(state.stitches[1]).toMatchObject({ id: 1, torn: 0, tornStep: -1, restLength: config.spacing * 9 });
+
+    const snap = buildSnapshot(config, model, state, ops);
+    expect(snap.stitchCount).toBe(2);
+    expect(snap.activeStitchCount).toBe(1);
+    expect(snap.stitches[0].generation).toBe(1);
+    expect(snap.stitches[1].generation).toBe(2);
+    expect(snap.stitches[0].tornStep).toBe(2);
+    expect(snap.stitches[1].tornStep).toBeNull();
+  });
+
+  it('同一对端点之间已有活动缝线时补缝被拒绝，状态与日志不变', () => {
+    const { model, state, a, b } = tearAway();
+    const ops: ClothOp[] = [];
+    mendNow(model, state, ops, a, b);
+    const before = cloneState(state);
+    const opsBefore = ops.length;
+
+    const again = prepareMendOp(model, state, a, b);
+    expect(again.ok).toBe(false);
+    expect(again.reason).toBe('alreadyStitched');
+    expect(prepareMendOp(model, state, b, a).reason).toBe('alreadyStitched'); // 顺序不敏感
+    expect(state.stitches.length).toBe(before.stitches.length);
+    expect(ops.length).toBe(opsBefore);
+    expect(Array.from(state.pos)).toEqual(Array.from(before.pos));
+  });
+});
+
+describe('补缝：拒绝场景不改变状态或日志', () => {
+  it('零距离拒绝', () => {
+    const { model, state, a, b } = tearAway();
+    place(state, b, state.pos[a * 2], state.pos[a * 2 + 1]); // 两端重合
+    const before = cloneState(state);
+    const r = prepareMendOp(model, state, a, b);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('zeroDistance');
+    expect(state.stitches).toEqual(before.stitches);
+    expect(state.pos[b * 2]).toBe(before.pos[b * 2]);
+  });
+
+  it('非法端点拒绝（越界 / 自身 / 非整数）', () => {
+    const { model, state, a } = tearAway();
+    const n = model.cols * model.rows;
+    expect(prepareMendOp(model, state, -1, a).reason).toBe('badEndpoint');
+    expect(prepareMendOp(model, state, a, n).reason).toBe('badEndpoint');
+    expect(prepareMendOp(model, state, a, a).reason).toBe('badEndpoint');
+    expect(prepareMendOp(model, state, a, a + 0.5).reason).toBe('badEndpoint');
+    expect(state.stitches).toHaveLength(0);
+  });
+
+  it('未撕裂边拒绝（含不是任何边的端点对）', () => {
+    const { model, state } = setup({ gravity: 0 });
+    const cols = model.cols;
+    const a = nodeId(0, 0, cols); // 相邻但完好的垂直边
+    const b = nodeId(1, 0, cols);
+    expect(state.torn[findOriginalEdge(model, a, b)!]).toBe(0);
+    expect(prepareMendOp(model, state, a, b).reason).toBe('edgeNotTorn');
+    const c = nodeId(1, 1, cols); // 对角点：根本不是网格边
+    expect(prepareMendOp(model, state, a, c).reason).toBe('edgeNotTorn');
+    expect(state.stitches).toHaveLength(0);
+  });
+
+  it('600 步冻结后补缝拒绝；伪造的冻结步 mend 日志也不生效，状态与日志不变', () => {
+    const { config, model, state, a, b } = tearAway();
+    const ops: ClothOp[] = [];
+    while (state.step < MAX_STEPS) stepOnce(config, model, state, ops);
+    const frozen = cloneState(state);
+
+    const r = prepareMendOp(model, state, a, b);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('frozen');
+    const fake: ClothOp = {
+      kind: 'mend', a, b, applyStep: MAX_STEPS, stitchId: 0,
+      restLength: config.spacing * 3,
+    };
+    ops.push(fake);
+    applyOpsAtStep(state, ops, model);
+    expect(state.stitches).toHaveLength(frozen.stitches.length);
+    expect(Array.from(state.pos)).toEqual(Array.from(frozen.pos));
+  });
+});
+
+describe('补缝：同一步操作次序、重放与分批一致', () => {
+  it('同一步连续补两条不同撕裂边：按请求顺序确定 id，立即施加幂等，暂停路径与重放一致', () => {
+    const config = makeConfig({ gravity: 0 });
+    const model = createClothModel(config);
+    const cols = config.cols;
+    // 顶排两条垂直边：a0-a? 取 (0,0)-(1,0) 与 (0,1)-(1,1)，上端都是顶排固定点。
+    const a0 = nodeId(0, 0, cols), b0 = nodeId(1, 0, cols);
+    const a1 = nodeId(0, 1, cols), b1 = nodeId(1, 1, cols);
+    function tearBoth() {
+      const s = createInitialState(config, model);
+      s.pinned[b0] = 1;
+      s.pinned[b1] = 1;
+      place(s, b0, config.originX, config.originY + config.spacing * 3);
+      place(s, b1, config.originX + config.spacing, config.originY + config.spacing * 3);
+      stepOnce(config, model, s, []);
+      expect(s.torn[findOriginalEdge(model, a0, b0)!]).toBe(1);
+      expect(s.torn[findOriginalEdge(model, a1, b1)!]).toBe(1);
+      return s;
+    }
+
+    // 实机：第 1 步暂停，两条 mend 消息按序到达（每条在 Worker 内即时校验→入日志→生效，
+    // 下一条 prepare 时已能看到上一条缝线，故 id 按消息次序确定），随后推进 120 步。
+    const live = new Stepper(config, model, tearBoth(), []);
+    const r0 = prepareMendOp(model, live.state, a0, b0);
+    expect(r0.op!.stitchId).toBe(0);
+    live.ops.push(r0.op!);
+    applyOpsAtStep(live.state, live.ops, model);
+    const r1 = prepareMendOp(model, live.state, a1, b1);
+    expect(r1.op!.stitchId).toBe(1);
+    live.ops.push(r1.op!);
+    applyOpsAtStep(live.state, live.ops, model);
+    applyOpsAtStep(live.state, live.ops, model); // 同帧重复施加：幂等，不得多出缝线
+    expect(live.state.stitches.map((s) => s.id)).toEqual([0, 1]);
+    live.advance(120);
+
+    // 重放：日志一开始就存在，非均匀分批 [13,47,60]（合计 120）到同一终点 121 步。
+    const replay = new Stepper(
+      config, model, tearBoth(),
+      [structuredClone(r0.op!), structuredClone(r1.op!)],
+    );
+    replay.advance(13);
+    replay.advance(47);
+    replay.advance(60);
+
+    expect(replay.state.step).toBe(live.state.step);
+    expect(Array.from(replay.state.pos)).toEqual(Array.from(live.state.pos));
+    expect(Array.from(replay.state.prev)).toEqual(Array.from(live.state.prev));
+    expect(Array.from(replay.state.torn)).toEqual(Array.from(live.state.torn));
+    expect(Array.from(replay.state.pinned)).toEqual(Array.from(live.state.pinned));
+    expect(replay.state.stitches).toEqual(live.state.stitches);
+  });
+
+  it('撕裂→补缝→再次撕裂→再次补缝：身份严格递增，一次性[600]与非均匀分批逐位一致', () => {
+    const config = makeConfig({ gravity: 0 });
+    const model = createClothModel(config);
+    const cols = config.cols;
+    const a = nodeId(0, 0, cols);
+    const b = nodeId(1, 0, cols);
+    // 用一条 move 日志确定性地驱动：step0 钉到 3s（原边撕裂），step2 钉到 9s（缝线断裂）。
+    const move: ClothOp = {
+      kind: 'move', node: b, applyStep: 0, releaseStep: MAX_STEPS + 1,
+      releasePinned: null,
+      points: [
+        { step: 0, x: config.originX, y: config.originY + config.spacing * 3 },
+        { step: 2, x: config.originX, y: config.originY + config.spacing * 9 },
+        { step: 3, x: config.originX, y: config.originY + config.spacing * 9 },
+      ],
+    };
+    const mend1: ClothOp = {
+      kind: 'mend', a, b, applyStep: 1, stitchId: 0, restLength: config.spacing * 3,
+    };
+    const mend2: ClothOp = {
+      kind: 'mend', a, b, applyStep: 3, stitchId: 1, restLength: config.spacing * 9,
+    };
+    const ops = [move, mend1, mend2].map((o) => structuredClone(o));
+
+    const oneShot = new Stepper(config, model, createInitialState(config, model), ops.map((o) => structuredClone(o)));
+    oneShot.advance(MAX_STEPS);
+
+    // 关键中间步核对（纯重放中 applyStep=s 的操作在 s→s+1 这一步开始时施加，
+    // 与 pin/move 的冻结帧语义一致；暂停态则靠同帧再 applyOpsAtStep 立即看到，见上一用例）。
+    const probe = new Stepper(config, model, createInitialState(config, model), ops.map((o) => structuredClone(o)));
+    probe.advance(2); // 完成 step0（原边撕裂）与 step1（第 1 代缝线在该步开始生成，本步仍活动）
+    expect(probe.state.step).toBe(2);
+    expect(probe.state.stitches.map((s) => [s.id, s.torn])).toEqual([[0, 0]]);
+    probe.advance(1); // 完成 step2：缝线在该步积分中按阈值断裂
+    expect(probe.state.step).toBe(3);
+    expect(probe.state.stitches.map((s) => [s.id, s.torn, s.tornStep])).toEqual([[0, 1, 2]]);
+    probe.advance(1); // 完成 step3：第 2 代缝线在该步开始时生成
+    expect(probe.state.step).toBe(4);
+    expect(probe.state.stitches.map((s) => [s.id, s.torn])).toEqual([[0, 1], [1, 0]]);
+
+    const batched = new Stepper(config, model, createInitialState(config, model), ops.map((o) => structuredClone(o)));
+    for (const n of [1, 7, 13, 31, 64, 128, MAX_STEPS - 244]) batched.advance(n);
+
+    expect(oneShot.state.stitches.map((s) => [s.id, s.torn, s.appliedStep, s.tornStep])).toEqual([
+      [0, 1, 1, 2],
+      [1, 0, 3, -1],
+    ]);
+    expect(Array.from(batched.state.pos)).toEqual(Array.from(oneShot.state.pos));
+    expect(Array.from(batched.state.prev)).toEqual(Array.from(oneShot.state.prev));
+    expect(Array.from(batched.state.torn)).toEqual(Array.from(oneShot.state.torn));
+    expect(batched.state.stitches).toEqual(oneShot.state.stitches);
+  });
+
+  it('runChecks：含撕裂/补缝/再撕裂/再补日志的 600 步不变量全部通过', () => {
+    const config = makeConfig({ gravity: 0 });
+    const model = createClothModel(config);
+    const cols = config.cols;
+    const a = nodeId(0, 0, cols);
+    const b = nodeId(1, 0, cols);
+    const ops: ClothOp[] = [
+      {
+        kind: 'move', node: b, applyStep: 0, releaseStep: MAX_STEPS + 1,
+        releasePinned: null,
+        points: [
+          { step: 0, x: config.originX, y: config.originY + config.spacing * 3 },
+          { step: 2, x: config.originX, y: config.originY + config.spacing * 9 },
+          { step: 3, x: config.originX, y: config.originY + config.spacing * 9 },
+        ],
+      },
+      { kind: 'mend', a, b, applyStep: 1, stitchId: 0, restLength: config.spacing * 3 },
+      { kind: 'mend', a, b, applyStep: 3, stitchId: 1, restLength: config.spacing * 9 },
+    ];
+    const report = runChecks(config, model, ops.map((o) => structuredClone(o)));
+    for (const item of report.items) {
+      expect(item.pass, `${item.name}: ${item.detail}`).toBe(true);
+    }
+    expect(report.pass).toBe(true);
   });
 });

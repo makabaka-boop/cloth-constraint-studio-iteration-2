@@ -1,5 +1,11 @@
 import type { CheckReport } from '../sim/check';
-import type { ClothConfig, ClothOp, MovePoint, Snapshot } from '../sim/types';
+import type {
+  ClothConfig,
+  ClothOp,
+  MendRejectReason,
+  MovePoint,
+  Snapshot,
+} from '../sim/types';
 
 /** 主线程 → Worker */
 export type WorkerRequest =
@@ -39,12 +45,34 @@ export type WorkerRequest =
       point?: MovePoint;
     }
   | {
+      type: 'mend';
+      epoch: number;
+      /** 布景师选中的当前已撕裂边的两个端点（顺序不敏感）。 */
+      a: number;
+      b: number;
+    }
+  | {
       type: 'check';
       epoch: number;
     };
 
 /** Worker → 主线程 */
 export type WorkerResponse =
-  | { type: 'snapshot'; epoch: number; snapshot: Snapshot }
+  | {
+      type: 'snapshot';
+      epoch: number;
+      snapshot: Snapshot;
+      /** 仅当本帧由一次补缝请求触发时附带补缝结果（用于 UI 反馈拒绝原因）。 */
+      mend?: { ok: true } | { ok: false; reason: MendRejectReason };
+    }
   | { type: 'check'; epoch: number; report: CheckReport }
   | { type: 'error'; epoch: number; message: string };
+
+/**
+ * 主线程判断回帧是否属于当前实验（epoch）。
+ * 重置/编辑参数 = terminate 旧 Worker + 递增 epoch 启新 Worker，
+ * 旧 Worker 迟到的任何帧（snapshot/check/error）都必须按同一规则丢弃。
+ */
+export function responseBelongsToEpoch(res: WorkerResponse, epoch: number): boolean {
+  return res.epoch === epoch;
+}

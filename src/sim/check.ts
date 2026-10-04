@@ -33,6 +33,19 @@ function statesEqual(a: ClothState, b: ClothState): boolean {
   for (let i = 0; i < a.torn.length; i++) {
     if (a.torn[i] !== b.torn[i]) return false;
   }
+  // 缝线代次与撕裂态也必须逐位/逐字段一致（含取证字段）。
+  if (a.stitches.length !== b.stitches.length) return false;
+  for (let k = 0; k < a.stitches.length; k++) {
+    const x = a.stitches[k];
+    const y = b.stitches[k];
+    if (
+      x.id !== y.id || x.a !== y.a || x.b !== y.b ||
+      x.restLength !== y.restLength || x.torn !== y.torn ||
+      x.appliedStep !== y.appliedStep || x.tornStep !== y.tornStep
+    ) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -99,7 +112,10 @@ export function runChecks(
   let driftFail = '';
   let groundFail = '';
   let tearFail = '';
+  let stitchFail = '';
   const tornHistory = new Uint8Array(model.edgeCount);
+  /** 上一帧每条缝线的撕裂标记：缝线只追加、撕裂只增不减。 */
+  const stitchHistory = new Map<number, number>();
   const nodeCount = model.cols * model.rows;
 
   while (state.step < MAX_STEPS) {
@@ -136,7 +152,47 @@ export function runChecks(
       }
       tornHistory[e] = state.torn[e];
     }
-    if (driftFail && groundFail && tearFail) break;
+
+    // —— 缝线不变量：身份只追加、撕裂只增、同一对端点至多一条活动缝线 ——
+    const activePairs = new Set<number>();
+    for (let k = 0; k < state.stitches.length; k++) {
+      const st = state.stitches[k];
+      if (st.id !== k) {
+        stitchFail = `step ${s} stitch[${k}].id=${st.id}：缝线 id 不按创建顺序连续`;
+        break;
+      }
+      if (!(st.restLength > 0)) {
+        stitchFail = `step ${s} stitch ${st.id}: 静长非正 ${st.restLength}`;
+        break;
+      }
+      const edgeId = findEdgeId(model, st.a, st.b);
+      if (edgeId < 0 || state.torn[edgeId] !== 1) {
+        stitchFail = `step ${s} stitch ${st.id}: 对应的原始边未撕裂或不存在（补缝倒改了历史）`;
+        break;
+      }
+      if (st.appliedStep > s) {
+        stitchFail = `step ${s} stitch ${st.id}: 提前出现（appliedStep=${st.appliedStep}）`;
+        break;
+      }
+      const wasTorn = stitchHistory.get(st.id) ?? 0;
+      if (wasTorn === 1 && st.torn !== 1) {
+        stitchFail = `step ${s} stitch ${st.id}: 缝线断裂后被复原`;
+        break;
+      }
+      if (st.torn !== 1) {
+        const key = st.a < st.b ? st.a * nodeCount + st.b : st.b * nodeCount + st.a;
+        if (activePairs.has(key)) {
+          stitchFail = `step ${s} stitch ${st.id}: 同一对端点存在多条活动缝线`;
+          break;
+        }
+        activePairs.add(key);
+      } else if (st.tornStep < 0 || st.tornStep > s) {
+        stitchFail = `step ${s} stitch ${st.id}: 断裂步记录非法 tornStep=${st.tornStep}`;
+        break;
+      }
+      stitchHistory.set(st.id, st.torn);
+    }
+    if (driftFail && groundFail && tearFail && stitchFail) break;
   }
 
   items.push({
@@ -153,6 +209,31 @@ export function runChecks(
     name: 'tearMonotonic',
     pass: !tearFail,
     detail: tearFail || `撕裂不可逆，最终撕裂边数 ${countTorn(state)}`,
+  });
+
+  // —— 缝线完整性：日志中的每条 mend 都必须真实生效且身份唯一 ——
+  // 防御式 apply 会跳过非法 mend，因此再做一次「日志 ↔ 状态」对账，
+  // 确保没有被静默吞掉的补缝（非法请求在正常路径上根本不会进入日志）。
+  if (!stitchFail) {
+    const mendOps = ops.filter((o): o is Extract<ClothOp, { kind: 'mend' }> => o.kind === 'mend');
+    if (mendOps.length !== state.stitches.length) {
+      stitchFail = `日志中 mend ${mendOps.length} 条，实际缝线 ${state.stitches.length} 条（有补缝被拒绝入日志却仍被重放？）`;
+    }
+    for (const op of mendOps) {
+      const st = state.stitches[op.stitchId];
+      if (!st || st.id !== op.stitchId || st.appliedStep !== op.applyStep ||
+        st.a !== op.a || st.b !== op.b || st.restLength !== op.restLength) {
+        stitchFail = `mend(stitch=${op.stitchId}, step=${op.applyStep}) 与生效缝线不一致`;
+        break;
+      }
+    }
+  }
+  items.push({
+    name: 'stitchIntegrity',
+    pass: !stitchFail,
+    detail:
+      stitchFail ||
+      `补缝 ${state.stitches.length} 次（活动 ${countActiveStitches(state)}），身份追加、旧边保持 torn、端点间至多一条活动缝线`,
   });
 
   // —— 4：分批一致性 ——
@@ -222,6 +303,22 @@ function countTorn(state: ClothState): number {
   let n = 0;
   for (let i = 0; i < state.torn.length; i++) if (state.torn[i]) n++;
   return n;
+}
+
+function countActiveStitches(state: ClothState): number {
+  let n = 0;
+  for (const st of state.stitches) if (!st.torn) n++;
+  return n;
+}
+
+/** 找两端点（顺序不敏感）对应的原始边 id；不存在返回 -1。 */
+function findEdgeId(model: ClothModel, a: number, b: number): number {
+  for (let e = 0; e < model.edgeCount; e++) {
+    const x = model.edgeA[e];
+    const y = model.edgeB[e];
+    if ((x === a && y === b) || (x === b && y === a)) return e;
+  }
+  return -1;
 }
 
 /**

@@ -52,11 +52,42 @@ export function buildSnapshot(
   }
   for (let p = 0; p < n; p++) if (state.pinned[p]) pinnedCount++;
 
+  // 缝线快照：按 id 升序全部输出（含已再次撕裂的代次），代次 = 同一对端点上的补缝次数。
+  // 与原始 edges 同源构建，Canvas / 检查面板 / JSON 导出读到的代次必然一致。
+  const pairGen = new Map<number, number>();
+  const pairKey = (a: number, b: number) => (a < b ? a * n + b : b * n + a);
+  const stitches: Snapshot['stitches'] = state.stitches.map((st) => {
+    const key = pairKey(st.a, st.b);
+    const generation = (pairGen.get(key) ?? 0) + 1;
+    pairGen.set(key, generation);
+    let strain: number | null = null;
+    if (!st.torn) {
+      const dx = state.pos[st.b * 2] - state.pos[st.a * 2];
+      const dy = state.pos[st.b * 2 + 1] - state.pos[st.a * 2 + 1];
+      strain = Math.sqrt(dx * dx + dy * dy) / st.restLength;
+    }
+    return {
+      id: st.id,
+      generation,
+      a: st.a,
+      b: st.b,
+      restLength: st.restLength,
+      torn: st.torn === 1,
+      appliedStep: st.appliedStep,
+      tornStep: st.tornStep < 0 ? null : st.tornStep,
+      strain,
+    };
+  });
+  const activeStitchCount = state.stitches.reduce((acc, st) => acc + (st.torn ? 0 : 1), 0);
+
   return {
     step: state.step,
     nodes,
     edges,
+    stitches,
     tornCount,
+    activeStitchCount,
+    stitchCount: state.stitches.length,
     pinnedCount,
     reachedMax: state.step >= MAX_STEPS,
     config,

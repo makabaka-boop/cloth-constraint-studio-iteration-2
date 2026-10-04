@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CheckReport } from '../sim/check';
 import { DEFAULT_CONFIG } from '../sim/cloth';
-import type { ClothConfig, ClothOp, MovePoint, Snapshot } from '../sim/types';
+import type { ClothConfig, ClothOp, MendRejectReason, MovePoint, Snapshot } from '../sim/types';
 import { MAX_STEPS } from '../sim/types';
-import type { WorkerRequest, WorkerResponse } from '../worker/protocol';
+import { responseBelongsToEpoch, type WorkerRequest, type WorkerResponse } from '../worker/protocol';
 
 export interface ActiveDrag {
   node: number;
@@ -16,6 +16,15 @@ interface PendingMove {
   wasPinned: boolean;
 }
 
+/** 补缝请求的反馈（成功/拒绝原因），供画面下方提示条短暂展示。 */
+export interface MendNotice {
+  ok: boolean;
+  reason?: MendRejectReason;
+  a?: number;
+  b?: number;
+  step: number;
+}
+
 export interface ClothApi {
   snapshot: Snapshot | null;
   config: ClothConfig;
@@ -23,6 +32,7 @@ export interface ClothApi {
   drag: ActiveDrag | null;
   report: CheckReport | null;
   busy: boolean;
+  mendNotice: MendNotice | null;
   reset: (config?: ClothConfig) => void;
   togglePlay: () => void;
   step: (count: number) => void;
@@ -30,6 +40,9 @@ export interface ClothApi {
   beginDrag: (node: number, x: number, y: number) => void;
   updateDrag: (x: number, y: number) => void;
   endDrag: () => void;
+  /** 请求在当前步对某条已撕裂边的两个端点补缝；拒绝时状态与日志均不变。 */
+  mend: (a: number, b: number) => void;
+  clearMendNotice: () => void;
   runChecks: () => void;
 }
 
@@ -40,6 +53,7 @@ export function useClothSimulation(): ClothApi {
   const [drag, setDrag] = useState<ActiveDrag | null>(null);
   const [report, setReport] = useState<CheckReport | null>(null);
   const [busy, setBusy] = useState(false);
+  const [mendNotice, setMendNotice] = useState<MendNotice | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
   const epochRef = useRef(0);
@@ -73,8 +87,8 @@ export function useClothSimulation(): ClothApi {
     });
     worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
       const res = e.data;
-      // epoch 防护：旧实验/旧 Worker 的任何回帧一律丢弃。
-      if (res.epoch !== epochRef.current) return;
+      // epoch 防护（与 Worker 内部同一份判定）：旧实验/旧 Worker 重置后迟到的任何帧一律丢弃。
+      if (!responseBelongsToEpoch(res, epochRef.current)) return;
       if (res.type === 'error') {
         console.error('cloth worker error:', res.message);
         return;
@@ -87,6 +101,15 @@ export function useClothSimulation(): ClothApi {
       pendingReplyRef.current = false;
       snapshotRef.current = res.snapshot;
       setSnapshot(res.snapshot);
+
+      // 补缝请求的反馈：拒绝时 Worker 没有改状态/日志，这里只更新提示条。
+      if (res.mend) {
+        setMendNotice(
+          res.mend.ok
+            ? { ok: true, step: res.snapshot.step }
+            : { ok: false, reason: res.mend.reason, step: res.snapshot.step },
+        );
+      }
 
       // 在途 advance 期间松手：此刻才知道准确的下一步编号，释放它。
       const finish = finishIntentRef.current;
@@ -121,6 +144,7 @@ export function useClothSimulation(): ClothApi {
     playingRef.current = false;
     setPlaying(false);
     setReport(null);
+    setMendNotice(null);
     setDrag(null);
     dragRef.current = null;
     pointerRef.current = null;
@@ -288,6 +312,20 @@ export function useClothSimulation(): ClothApi {
     post({ type: 'check', epoch: epochRef.current });
   }, [post]);
 
+  // 补缝是独立消息（不随 advance 排队）：Worker 总在当前已提交步处理，
+  // 缝线在该步「下一次积分之前」生效；即使播放中有在途 advance，
+  // Worker 也是先完成那一帧积分再处理补缝，静长仍取生效步两端实际距离。
+  const mend = useCallback((a: number, b: number) => {
+    const snap = snapshotRef.current;
+    if (!snap || snap.reachedMax) {
+      setMendNotice({ ok: false, reason: 'frozen', step: snap?.step ?? MAX_STEPS });
+      return;
+    }
+    post({ type: 'mend', epoch: epochRef.current, a, b });
+  }, [post]);
+
+  const clearMendNotice = useCallback(() => setMendNotice(null), []);
+
   return {
     snapshot,
     config,
@@ -295,6 +333,7 @@ export function useClothSimulation(): ClothApi {
     drag,
     report,
     busy,
+    mendNotice,
     reset,
     togglePlay,
     step,
@@ -302,6 +341,8 @@ export function useClothSimulation(): ClothApi {
     beginDrag,
     updateDrag,
     endDrag,
+    mend,
+    clearMendNotice,
     runChecks,
   };
 }
