@@ -69,6 +69,7 @@ export function cloneState(state: ClothState): ClothState {
     prev: new Float64Array(state.prev),
     pinned: new Uint8Array(state.pinned),
     torn: new Uint8Array(state.torn),
+    seams: state.seams.map((sm) => ({ ...sm })),
     step: state.step,
   };
 }

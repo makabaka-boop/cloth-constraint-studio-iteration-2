@@ -254,7 +254,7 @@ describe('分批推进一致性', () => {
       points: [{ step: 40, x: 300, y: 50 }],
     };
     live.ops.push(op);
-    applyOpsAtStep(live.state, live.ops); // Worker addOps 的暂停路径
+    applyOpsAtStep(model, live.state, live.ops); // Worker addOps 的暂停路径
     live.advance(560);
 
     // 重放：同一操作日志一开始就存在，连续 600 步。

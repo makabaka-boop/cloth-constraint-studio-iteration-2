@@ -39,6 +39,13 @@ export type WorkerRequest =
       point?: MovePoint;
     }
   | {
+      type: 'mend';
+      epoch: number;
+      /** 一条当前已撕裂原始边的两个端点。 */
+      a: number;
+      b: number;
+    }
+  | {
       type: 'check';
       epoch: number;
     };
@@ -47,4 +54,5 @@ export type WorkerRequest =
 export type WorkerResponse =
   | { type: 'snapshot'; epoch: number; snapshot: Snapshot }
   | { type: 'check'; epoch: number; report: CheckReport }
+  | { type: 'mendRejected'; epoch: number; reason: string }
   | { type: 'error'; epoch: number; message: string };

@@ -3,10 +3,13 @@ import type { Snapshot } from '../sim/types';
 
 interface Props {
   snapshot: Snapshot | null;
+  mendMode: boolean;
+  mendAnchor: number | null;
   onTogglePin: (node: number) => void;
   onBeginDrag: (node: number, x: number, y: number) => void;
   onUpdateDrag: (x: number, y: number) => void;
   onEndDrag: () => void;
+  onPickMendEndpoint: (node: number) => void;
   onHover: (node: number | null) => void;
 }
 
@@ -15,14 +18,19 @@ const DRAG_THRESHOLD = 4;
 
 export function ClothCanvas({
   snapshot,
+  mendMode,
+  mendAnchor,
   onTogglePin,
   onBeginDrag,
   onUpdateDrag,
   onEndDrag,
+  onPickMendEndpoint,
   onHover,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const snapRef = useRef<Snapshot | null>(snapshot);
+  const mendModeRef = useRef(mendMode);
+  const mendAnchorRef = useRef(mendAnchor);
   const [hover, setHover] = useState<number | null>(null);
   const hoverRef = useRef<number | null>(null);
   const downRef = useRef<{ node: number; x: number; y: number; moved: boolean } | null>(null);
@@ -30,6 +38,12 @@ export function ClothCanvas({
   useEffect(() => {
     snapRef.current = snapshot;
   }, [snapshot]);
+  useEffect(() => {
+    mendModeRef.current = mendMode;
+  }, [mendMode]);
+  useEffect(() => {
+    mendAnchorRef.current = mendAnchor;
+  }, [mendAnchor]);
   useEffect(() => {
     hoverRef.current = hover;
   }, [hover]);
@@ -45,7 +59,7 @@ export function ClothCanvas({
       const snap = snapRef.current;
       if (canvas && snap) {
         const ctx = canvas.getContext('2d');
-        if (ctx) render(ctx, snap, hoverRef.current);
+        if (ctx) render(ctx, snap, hoverRef.current, mendModeRef.current, mendAnchorRef.current);
       }
       raf = requestAnimationFrame(draw);
     };
@@ -84,6 +98,11 @@ export function ClothCanvas({
     const node = pickNode(x, y);
     if (node === null) return;
     (e.target as Element).setPointerCapture(e.pointerId);
+    if (mendModeRef.current) {
+      // 补缝模式：点击即选择端点（不进入拖动/固定流程）。
+      onPickMendEndpoint(node);
+      return;
+    }
     downRef.current = { node, x, y, moved: false };
   };
 
@@ -107,7 +126,11 @@ export function ClothCanvas({
     if (node !== hover) {
       setHover(node);
       onHover(node);
-      canvasRef.current!.style.cursor = node === null ? 'default' : 'grab';
+      canvasRef.current!.style.cursor = node === null
+        ? 'default'
+        : mendModeRef.current
+          ? 'crosshair'
+          : 'grab';
     }
   };
 
@@ -162,7 +185,13 @@ function clampPointer(x: number, y: number, snap: Snapshot) {
   };
 }
 
-function render(ctx: CanvasRenderingContext2D, snap: Snapshot, hover: number | null) {
+function render(
+  ctx: CanvasRenderingContext2D,
+  snap: Snapshot,
+  hover: number | null,
+  mendMode: boolean,
+  mendAnchor: number | null,
+) {
   const { canvasWidth: w, canvasHeight: h, groundY } = snap.config;
   ctx.clearRect(0, 0, w, h);
 
@@ -180,7 +209,7 @@ function render(ctx: CanvasRenderingContext2D, snap: Snapshot, hover: number | n
   ctx.fillStyle = 'rgba(91,140,90,0.12)';
   ctx.fillRect(0, groundY, w, h - groundY);
 
-  // 撕裂边（红虚线）
+  // 撕裂边（红虚线）—— 取证轨迹永久保留，补缝不改变旧边的 torn 状态
   ctx.lineWidth = 1;
   ctx.setLineDash([4, 4]);
   ctx.strokeStyle = 'rgba(229,72,77,0.55)';
@@ -208,6 +237,31 @@ function render(ctx: CanvasRenderingContext2D, snap: Snapshot, hover: number | n
     ctx.stroke();
   }
 
+  // 补缝缝线：活动 = 青色实线（标注代次）；已断裂 = 暗青虚线（同样留作取证轨迹）
+  for (const seam of snap.seams) {
+    const a = snap.nodes[seam.a];
+    const b = snap.nodes[seam.b];
+    ctx.beginPath();
+    if (seam.torn) {
+      ctx.setLineDash([3, 5]);
+      ctx.strokeStyle = 'rgba(94, 160, 170, 0.4)';
+      ctx.lineWidth = 1;
+    } else {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = '#4dd0e1';
+      ctx.lineWidth = 1.8;
+    }
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (!seam.torn) {
+      ctx.fillStyle = 'rgba(77, 208, 225, 0.85)';
+      ctx.font = '9px system-ui, sans-serif';
+      ctx.fillText(`补${seam.generation}`, (a.x + b.x) / 2 + 4, (a.y + b.y) / 2 - 4);
+    }
+  }
+
   // 节点
   for (const n of snap.nodes) {
     ctx.beginPath();
@@ -218,6 +272,29 @@ function render(ctx: CanvasRenderingContext2D, snap: Snapshot, hover: number | n
       ctx.strokeStyle = '#e85d04';
       ctx.lineWidth = 1;
       ctx.strokeRect(n.x - 6, n.y - 6, 12, 12);
+    }
+  }
+
+  // 补缝模式：高亮所有已撕裂边的端点（合法选择），并标出已选的第一个端点
+  if (mendMode) {
+    ctx.strokeStyle = 'rgba(77, 208, 225, 0.8)';
+    ctx.lineWidth = 1.2;
+    for (const edge of snap.edges) {
+      if (!edge.torn) continue;
+      for (const id of [edge.a, edge.b]) {
+        const n = snap.nodes[id];
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, 6, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    if (mendAnchor !== null && snap.nodes[mendAnchor]) {
+      const n = snap.nodes[mendAnchor];
+      ctx.strokeStyle = '#4dd0e1';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 9, 0, Math.PI * 2);
+      ctx.stroke();
     }
   }
 

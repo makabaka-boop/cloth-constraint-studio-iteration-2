@@ -52,12 +52,38 @@ export function buildSnapshot(
   }
   for (let p = 0; p < n; p++) if (state.pinned[p]) pinnedCount++;
 
+  // 补缝缝线：与边同一快照、同一时间点的数据，含代次（generation）。
+  const seams = new Array<Snapshot['seams'][number]>(state.seams.length);
+  let activeSeamCount = 0;
+  for (let k = 0; k < state.seams.length; k++) {
+    const sm = state.seams[k];
+    let strain: number | null = null;
+    if (!sm.torn) {
+      activeSeamCount++;
+      const dx = state.pos[sm.b * 2] - state.pos[sm.a * 2];
+      const dy = state.pos[sm.b * 2 + 1] - state.pos[sm.a * 2 + 1];
+      strain = Math.sqrt(dx * dx + dy * dy) / sm.rest;
+    }
+    seams[k] = {
+      id: sm.id,
+      a: sm.a,
+      b: sm.b,
+      restLength: sm.rest,
+      generation: sm.generation,
+      createdStep: sm.createdStep,
+      torn: sm.torn,
+      strain,
+    };
+  }
+
   return {
     step: state.step,
     nodes,
     edges,
+    seams,
     tornCount,
     pinnedCount,
+    activeSeamCount,
     reachedMax: state.step >= MAX_STEPS,
     config,
     ops: ops.slice(),

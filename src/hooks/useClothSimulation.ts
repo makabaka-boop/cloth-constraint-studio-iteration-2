@@ -23,6 +23,12 @@ export interface ClothApi {
   drag: ActiveDrag | null;
   report: CheckReport | null;
   busy: boolean;
+  /** 补缝模式：开启后画布点击用于依次选择已撕裂边的两个端点。 */
+  mendMode: boolean;
+  /** 补缝模式下已选中的第一个端点。 */
+  mendAnchor: number | null;
+  /** 最近一次补缝被 Worker 拒绝的原因（下一次操作自动清除）。 */
+  mendError: string | null;
   reset: (config?: ClothConfig) => void;
   togglePlay: () => void;
   step: (count: number) => void;
@@ -30,6 +36,8 @@ export interface ClothApi {
   beginDrag: (node: number, x: number, y: number) => void;
   updateDrag: (x: number, y: number) => void;
   endDrag: () => void;
+  setMendMode: (on: boolean) => void;
+  pickMendEndpoint: (node: number) => void;
   runChecks: () => void;
 }
 
@@ -40,6 +48,9 @@ export function useClothSimulation(): ClothApi {
   const [drag, setDrag] = useState<ActiveDrag | null>(null);
   const [report, setReport] = useState<CheckReport | null>(null);
   const [busy, setBusy] = useState(false);
+  const [mendMode, setMendModeState] = useState(false);
+  const [mendAnchor, setMendAnchor] = useState<number | null>(null);
+  const [mendError, setMendError] = useState<string | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
   const epochRef = useRef(0);
@@ -77,6 +88,12 @@ export function useClothSimulation(): ClothApi {
       if (res.epoch !== epochRef.current) return;
       if (res.type === 'error') {
         console.error('cloth worker error:', res.message);
+        return;
+      }
+      if (res.type === 'mendRejected') {
+        // 补缝被拒绝：Worker 未改状态与日志，仅提示原因。
+        setMendError(res.reason);
+        setMendAnchor(null);
         return;
       }
       if (res.type === 'check') {
@@ -126,6 +143,9 @@ export function useClothSimulation(): ClothApi {
     pointerRef.current = null;
     snapshotRef.current = null;
     setSnapshot(null);
+    setMendModeState(false);
+    setMendAnchor(null);
+    setMendError(null);
     const next = cfg ?? config;
     if (cfg) setConfig(cfg);
     spawnWorker(next);
@@ -283,6 +303,26 @@ export function useClothSimulation(): ClothApi {
     }
   }, [post]);
 
+  // —— 补缝：依次选择一条已撕裂边的两个端点，Worker 校验后生成新身份缝线 ——
+  const setMendMode = useCallback((on: boolean) => {
+    setMendModeState(on);
+    setMendAnchor(null);
+    setMendError(null);
+    if (on) endDrag(); // 退出补缝模式外的拖动，避免点击语义冲突
+  }, [endDrag]);
+
+  const pickMendEndpoint = useCallback((node: number) => {
+    setMendError(null);
+    setMendAnchor((anchor) => {
+      if (anchor === null) return node; // 记录第一个端点
+      if (anchor === node) return null; // 再点同一节点：取消选择
+      // 第二个端点确定：交给 Worker 校验（非法/零距离/未撕裂/冻结都会被拒绝，
+      // 且不会改变状态与日志；接受则在下一次积分前生成缝线）。
+      post({ type: 'mend', epoch: epochRef.current, a: anchor, b: node });
+      return null;
+    });
+  }, [post]);
+
   const runChecks = useCallback(() => {
     setBusy(true);
     post({ type: 'check', epoch: epochRef.current });
@@ -295,6 +335,9 @@ export function useClothSimulation(): ClothApi {
     drag,
     report,
     busy,
+    mendMode,
+    mendAnchor,
+    mendError,
     reset,
     togglePlay,
     step,
@@ -302,6 +345,8 @@ export function useClothSimulation(): ClothApi {
     beginDrag,
     updateDrag,
     endDrag,
+    setMendMode,
+    pickMendEndpoint,
     runChecks,
   };
 }

@@ -8,7 +8,7 @@ React 18 + TypeScript + Canvas + Web Worker 的确定性二维布料物理实验
 ```bash
 npm install
 npm run dev      # 开发服务器
-npm test         # 运行 20 个测试（模拟核心 + Worker 协议）
+npm test         # 运行 35 个测试（模拟核心 + Worker 协议）
 npm run build    # tsc 严格类型检查 + 生产构建
 npm run preview  # 预览构建产物
 ```
@@ -19,7 +19,13 @@ npm run preview  # 预览构建产物
 - **拖动节点**：移动挂点。拖动既有固定点松手后锚定在终点；抓起自由节点松手后脱落
 - **▶ 播放 / ⏸ 暂停**：播放时每个 `requestAnimationFrame` 推进恰好 1 个固定时间步
 - **单步 +1 / 推进 N 步**：手动分批推进
-- 右侧面板可悬停检查任意节点的位置、速度、固定态；可跑 600 步自动不变量核对；可导出当前快照 JSON
+- **🪡 补缝模式**：依次点击一条**当前已撕裂边**的两个端点，在下一次积分前生成一条
+  新身份的缝线约束；静长取生效时两端的实际距离。旧边保持 torn（取证轨迹保留），
+  同一端点对同时至多一条活动缝线；缝线按同一撕裂阈值断裂，再次补缝产生新身份（代次 +1）。
+  零距离、非法端点、未撕裂边、已有活动缝线及 600 步冻结后的补缝一律被拒绝，
+  且不改变状态与操作日志（面板显示拒绝原因）
+- 右侧面板可悬停检查任意节点的位置、速度、固定态；查看含代次的缝线列表；
+  可跑 600 步自动不变量核对；可导出当前快照 JSON
 - 编辑网格尺寸 / 间距 / 重力 / 阻尼 / 刚度 / 迭代次数 / 撕裂倍数 / 地面等参数后，点「应用参数并重置实验」
 
 ## 物理模型（`src/sim/cloth.ts`）
@@ -30,6 +36,10 @@ npm run preview  # 预览构建产物
   Jakobsen 位置型修正按动度分配（固定点动度为 0，不被任何边拉动）
 - **一次性撕裂**：某边首次检测到当前长度 > `restLength * tearFactor` 即置 torn=1，
   之后每一步直接跳过该边，永不恢复、不再施加约束
+- **补缝缝线**：`mend` 操作在生效步、积分之前生成动态缝线（`state.seams`），
+  静长 = 生效时两端实际距离；缝线在每次迭代的约束扫描中有**稳定位置**——
+  每次迭代扫完水平、垂直原始边之后，按创建顺序（id 升序）扫描；
+  缝线按同一 `tearFactor` 断裂且不可逆，再次补缝生成新 id、代次递增
 - **地面碰撞**：节点 y 夹到 groundY，法向速度清零、切向施摩擦；固定点不参与（位置逐位精确）
 - 上限 **600 步**，达到后状态冻结
 
@@ -49,6 +59,9 @@ npm run preview  # 预览构建产物
 
 操作在「每步积分之前」应用，因此固定点在该步绝不会漂移；暂停态对冻结帧的操作通过
 `applyOpsAtStep` 幂等回放，同帧抓起又松手的移动（释放步定位点）在实机与从头重放中逐位一致。
+同一步内操作的规范次序为 pin/unpin → move → mend：mend 排在本步所有定位操作之后，
+静长取定位完成后的实际距离；暂停态同一冻结步先补缝、后到的 move 会触发本步缝线重建，
+保证实机逐步追加与一次重放逐位一致。
 
 ## 自动不变量核对（右侧按钮，`src/sim/check.ts`）
 
@@ -59,7 +72,8 @@ npm run preview  # 预览构建产物
 | `fixedNoDrift` | 每个固定点逐位不漂移，只允许出现在活动 move 轨迹上 |
 | `ground` | 600 步每一帧所有节点 y ≤ groundY |
 | `tearMonotonic` | torn 标记只增不减，撕裂不可逆 |
-| `determinism` | 一次性 / 非均匀分批 / 逐步三种推进逐位相等 |
+| `seamIntegrity` | 缝线断裂不可逆、同端点对至多一条活动缝线、代次严格递增 |
+| `determinism` | 一次性 / 非均匀分批 / 逐步三种推进逐位相等（含缝线状态） |
 | `pinSemantics` | 独立标量回放 pin/unpin/move（含释放语义），最终固定态一致 |
 | `cap` | 达到 600 步后再推进状态冻结 |
 
@@ -74,9 +88,9 @@ src/
     snapshot.ts     唯一快照构建 + 序列化
     check.ts        600 步不变量核对
   worker/
-    sim.worker.ts   Worker：持有模型/状态/日志，处理 init/advance/addOps/check
+    sim.worker.ts   Worker：持有模型/状态/日志，处理 init/advance/addOps/mend/check
     protocol.ts     主线程 ↔ Worker 消息类型
   hooks/
-    useClothSimulation.ts  Worker 生命周期、epoch、播放循环、拖动/固定交互
+    useClothSimulation.ts  Worker 生命周期、epoch、播放循环、拖动/固定/补缝交互
   components/     ClothCanvas / ControlPanel / StatusPanel
 ```

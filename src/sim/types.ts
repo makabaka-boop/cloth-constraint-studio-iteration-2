@@ -69,6 +69,30 @@ export interface ClothModel {
   initialPins: Int32Array;
 }
 
+/**
+ * 补缝生成的缝线约束（动态边）。
+ * 由 mend 操作在日志生效步、下一次积分之前创建；创建后身份与静长不可变，
+ * 唯一可变的标记是 torn（断裂不可逆，与原边撕裂语义一致）。
+ */
+export interface SeamState {
+  /**
+   * 稳定身份：创建序号（恒等于 seams 数组下标）。
+   * 每次补缝都产生新 id，同一端点对再次补缝不会复用旧身份。
+   */
+  id: number;
+  /** 端点节点索引（取自被补的那条已撕裂原始边）。 */
+  a: number;
+  b: number;
+  /** 静长：补缝生效那一刻两端点的实际距离。 */
+  rest: number;
+  /** 该端点对的补缝代次（从 1 开始，每次补缝 +1）。 */
+  generation: number;
+  /** 创建所在步（操作生效步）。 */
+  createdStep: number;
+  /** 缝线是否已断裂（按与原边相同的撕裂阈值判定，不可逆）。 */
+  torn: boolean;
+}
+
 /** 动态模拟状态。 */
 export interface ClothState {
   pos: Float64Array;
@@ -77,6 +101,8 @@ export interface ClothState {
   pinned: Uint8Array;
   /** 0 = 完好，1 = 已撕裂。撕裂不可逆，后续步骤不再施加该边约束。 */
   torn: Uint8Array;
+  /** 补缝缝线（按创建顺序排列，约束扫描顺序即此顺序）。 */
+  seams: SeamState[];
   /** 已完成的步数（0～MAX_STEPS）。 */
   step: number;
 }
@@ -102,6 +128,14 @@ export type ClothOp =
       releasePinned: boolean | null;
       /** 按 step 升序的轨迹点；每步取 step <= 当前步 的最后一个点。 */
       points: MovePoint[];
+    }
+  | {
+      kind: 'mend';
+      /** 一条「当前已撕裂原始边」的两个端点（顺序无关）。 */
+      a: number;
+      b: number;
+      /** 在该步开始、积分之前生成缝线；静长取生效时两端实际距离。 */
+      applyStep: number;
     };
 
 /** 供渲染 / 单步检查 / 导出共用的唯一模拟快照。 */
@@ -123,8 +157,22 @@ export interface Snapshot {
     torn: boolean;
     strain: number | null; // 当前长度/restLength，撕裂边为 null
   }>;
+  /** 补缝缝线（含代次）；Canvas、检查面板、JSON 导出与 Worker 共用这一份。 */
+  seams: Array<{
+    id: number;
+    a: number;
+    b: number;
+    restLength: number;
+    /** 该端点对的补缝代次（从 1 开始）。 */
+    generation: number;
+    createdStep: number;
+    torn: boolean;
+    strain: number | null; // 当前长度/restLength，断裂缝线为 null
+  }>;
   tornCount: number;
   pinnedCount: number;
+  /** 活动（未断裂）缝线数。 */
+  activeSeamCount: number;
   reachedMax: boolean;
   config: ClothConfig;
   ops: ClothOp[];

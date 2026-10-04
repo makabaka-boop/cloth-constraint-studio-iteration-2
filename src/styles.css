@@ -123,3 +123,15 @@ input[type='number'], select {
 .report li.ok { color: #8fd9a4; }
 .report li.bad { color: #f2a0a0; }
 .report li span { color: #b7bed4; font-size: 11px; }
+
+.mend-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #f2a0a0;
+  background: rgba(210, 80, 80, 0.12);
+  border: 1px solid #8c4040;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.kv thead td { color: #8b93ad; border-bottom: 1px solid #2a3452; }

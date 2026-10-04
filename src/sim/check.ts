@@ -33,7 +33,32 @@ function statesEqual(a: ClothState, b: ClothState): boolean {
   for (let i = 0; i < a.torn.length; i++) {
     if (a.torn[i] !== b.torn[i]) return false;
   }
+  return seamsEqual(a.seams, b.seams);
+}
+
+function seamsEqual(a: ClothState['seams'], b: ClothState['seams']): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.id !== y.id ||
+      x.a !== y.a ||
+      x.b !== y.b ||
+      x.rest !== y.rest ||
+      x.generation !== y.generation ||
+      x.createdStep !== y.createdStep ||
+      x.torn !== y.torn
+    ) {
+      return false;
+    }
+  }
   return true;
+}
+
+/** 无序端点对键（与端点顺序无关）。 */
+function pairKey(a: number, b: number): string {
+  return a < b ? `${a}-${b}` : `${b}-${a}`;
 }
 
 /** 按给定批次大小推进，用于一致性核对。 */
@@ -84,8 +109,9 @@ function activeMoveTarget(
  * 1. fixedNoDrift  固定点不漂移（仅可被活动 move 操作精确移动）
  * 2. ground        所有节点始终不在地面之下
  * 3. tearMonotonic 撕裂只增不减、不可逆
- * 4. determinism   同一日志不同分批逐位一致
- * 5. cap           不超过 600 步，超步后状态冻结
+ * 4. seamIntegrity 缝线断裂不可逆、同端点对至多一条活动缝线、代次递增
+ * 5. determinism   同一日志不同分批逐位一致
+ * 6. cap           不超过 600 步，超步后状态冻结
  */
 export function runChecks(
   config: ClothConfig,
@@ -94,12 +120,15 @@ export function runChecks(
 ): CheckReport {
   const items: CheckItem[] = [];
 
-  // —— 1/2/3：逐帧推进并记录不变量 ——
+  // —— 1/2/3/4：逐帧推进并记录不变量 ——
   const state = createInitialState(config, model);
   let driftFail = '';
   let groundFail = '';
   let tearFail = '';
+  let seamFail = '';
   const tornHistory = new Uint8Array(model.edgeCount);
+  const seamTornHistory: boolean[] = [];
+  const seamGenByPair = new Map<string, number>();
   const nodeCount = model.cols * model.rows;
 
   while (state.step < MAX_STEPS) {
@@ -136,7 +165,30 @@ export function runChecks(
       }
       tornHistory[e] = state.torn[e];
     }
-    if (driftFail && groundFail && tearFail) break;
+
+    // 缝线：断裂不可逆；同一端点对同时至多一条活动缝线；代次按创建严格递增。
+    const activePairs = new Set<string>();
+    for (const sm of state.seams) {
+      if (seamTornHistory[sm.id] === true && !sm.torn) {
+        seamFail = `step ${s} seam ${sm.id}: 断裂后被复原`;
+      }
+      seamTornHistory[sm.id] = sm.torn;
+      const key = pairKey(sm.a, sm.b);
+      const seenGen = seamGenByPair.get(key) ?? 0;
+      if (sm.generation > seenGen) {
+        if (sm.generation !== seenGen + 1) {
+          seamFail = `step ${s} seam ${sm.id}: 代次 ${sm.generation} 未接续 ${seenGen}`;
+        }
+        seamGenByPair.set(key, sm.generation);
+      }
+      if (!sm.torn) {
+        if (activePairs.has(key)) {
+          seamFail = `step ${s}: 端点对 ${key} 存在多条活动缝线`;
+        }
+        activePairs.add(key);
+      }
+    }
+    if (driftFail && groundFail && tearFail && seamFail) break;
   }
 
   items.push({
@@ -153,6 +205,13 @@ export function runChecks(
     name: 'tearMonotonic',
     pass: !tearFail,
     detail: tearFail || `撕裂不可逆，最终撕裂边数 ${countTorn(state)}`,
+  });
+  items.push({
+    name: 'seamIntegrity',
+    pass: !seamFail,
+    detail:
+      seamFail ||
+      `缝线断裂不可逆、同端点对至多一条活动缝线、代次递增（共 ${state.seams.length} 条缝线）`,
   });
 
   // —— 4：分批一致性 ——

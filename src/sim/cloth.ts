@@ -7,6 +7,14 @@ import {
   type PinMode,
 } from './types';
 
+/** 补缝请求的拒绝原因（校验失败时不改变状态与日志）。 */
+export type MendRejection =
+  | 'frozen' // 已达 600 步上限，状态冻结
+  | 'invalid-endpoints' // 非法端点：不是任何一条原始边的两端
+  | 'edge-not-torn' // 该边当前未撕裂
+  | 'active-seam-exists' // 两端间已有一条活动缝线
+  | 'zero-distance'; // 两端当前距离为 0，无法定义静长
+
 export const DEFAULT_CONFIG: ClothConfig = {
   cols: 12,
   rows: 10,
@@ -113,16 +121,99 @@ export function createInitialState(config: ClothConfig, model: ClothModel): Clot
     prev: new Float64Array(pos), // 初始速度为 0
     pinned,
     torn: new Uint8Array(model.edgeCount),
+    seams: [],
     step: 0,
   };
 }
 
+/** 无序端点对是否一致。 */
+function samePair(a1: number, b1: number, a2: number, b2: number): boolean {
+  return (a1 === a2 && b1 === b2) || (a1 === b2 && b1 === a2);
+}
+
+/** 找到连接 (a,b) 的原始边下标；不存在返回 -1。 */
+function findEdgeBetween(model: ClothModel, a: number, b: number): number {
+  const { edgeA, edgeB, edgeCount } = model;
+  for (let e = 0; e < edgeCount; e++) {
+    if (samePair(edgeA[e], edgeB[e], a, b)) return e;
+  }
+  return -1;
+}
+
+/**
+ * 校验一次补缝请求。返回 null 表示可以补缝，否则给出拒绝原因。
+ * Worker 在把 mend 操作写入日志之前调用它；模拟核心在操作生效时再次调用，
+ * 两条路径判定同一状态，结果一致（校验失败：状态与日志都保持不变）。
+ */
+export function validateMend(
+  model: ClothModel,
+  state: ClothState,
+  a: number,
+  b: number,
+): MendRejection | null {
+  if (state.step >= MAX_STEPS) return 'frozen';
+  const nodeCount = model.cols * model.rows;
+  if (
+    !Number.isInteger(a) ||
+    !Number.isInteger(b) ||
+    a === b ||
+    a < 0 ||
+    b < 0 ||
+    a >= nodeCount ||
+    b >= nodeCount
+  ) {
+    return 'invalid-endpoints';
+  }
+  const edge = findEdgeBetween(model, a, b);
+  if (edge < 0) return 'invalid-endpoints';
+  if (state.torn[edge] !== 1) return 'edge-not-torn';
+  for (let k = 0; k < state.seams.length; k++) {
+    const sm = state.seams[k];
+    if (!sm.torn && samePair(sm.a, sm.b, a, b)) return 'active-seam-exists';
+  }
+  const dx = state.pos[b * 2] - state.pos[a * 2];
+  const dy = state.pos[b * 2 + 1] - state.pos[a * 2 + 1];
+  if (dx * dx + dy * dy === 0) return 'zero-distance';
+  return null;
+}
+
+/**
+ * 在当前状态上落实一次补缝（mend 操作生效）：
+ * 生成一条新身份的缝线，静长取此刻两端实际距离；被补的原始边保持 torn。
+ * 校验失败时不改变状态（返回 false）。
+ */
+function applyMend(model: ClothModel, state: ClothState, a: number, b: number): boolean {
+  if (validateMend(model, state, a, b) !== null) return false;
+  const dx = state.pos[b * 2] - state.pos[a * 2];
+  const dy = state.pos[b * 2 + 1] - state.pos[a * 2 + 1];
+  const rest = Math.sqrt(dx * dx + dy * dy);
+  let generation = 0;
+  for (let k = 0; k < state.seams.length; k++) {
+    if (samePair(state.seams[k].a, state.seams[k].b, a, b)) generation++;
+  }
+  state.seams.push({
+    id: state.seams.length, // 恒等于下标：创建顺序即稳定身份
+    a,
+    b,
+    rest,
+    generation: generation + 1,
+    createdStep: state.step,
+    torn: false,
+  });
+  return true;
+}
+
 /**
  * 把第 state.step 步开始时生效的操作施加到状态上。
- * pin / unpin 是瞬时标记；move 在其活动区间内每步把节点钉到目标位置。
+ * pin / unpin 是瞬时标记；move 在其活动区间内每步把节点钉到目标位置；
+ * mend 排在本步所有定位操作之后，静长取本步定位完成后的实际距离。
  * 操作在「积分之前」应用，因此固定点绝不会在该步发生漂移。
  */
-export function applyOpsAtStep(state: ClothState, ops: readonly ClothOp[]): void {
+export function applyOpsAtStep(
+  model: ClothModel,
+  state: ClothState,
+  ops: readonly ClothOp[],
+): void {
   const s = state.step;
   for (let k = 0; k < ops.length; k++) {
     const op = ops[k];
@@ -169,6 +260,29 @@ export function applyOpsAtStep(state: ClothState, ops: readonly ClothOp[]): void
       state.pinned[op.node] = op.releasePinned ? 1 : 0;
     }
   }
+  // mend 单独成趟，固定排在 pin/unpin 与 move 之后：静长取本步定位完成后的实际距离。
+  // 暂停态下同一冻结步可能先补缝、后又收到 move —— 先撤掉本步已建缝线再按日志顺序
+  // 重建，使「实机逐步追加」与「从初始状态一次重放」逐位一致（本步缝线尚未参与过
+  // 任何积分/约束，重建不改变历史）。
+  let hasMend = false;
+  for (let k = 0; k < ops.length; k++) {
+    const op = ops[k];
+    if (op.kind === 'mend' && op.applyStep === s) {
+      hasMend = true;
+      break;
+    }
+  }
+  if (hasMend) {
+    let keep = 0;
+    for (let k = 0; k < state.seams.length; k++) {
+      if (state.seams[k].createdStep !== s) state.seams[keep++] = state.seams[k];
+    }
+    state.seams.length = keep;
+    for (let k = 0; k < ops.length; k++) {
+      const op = ops[k];
+      if (op.kind === 'mend' && op.applyStep === s) applyMend(model, state, op.a, op.b);
+    }
+  }
 }
 
 /** 单个时间步：操作 → Verlet 积分 → 约束松弛（含一次性撕裂）→ 地面碰撞。 */
@@ -180,7 +294,7 @@ export function stepOnce(
 ): void {
   if (state.step >= MAX_STEPS) return;
 
-  applyOpsAtStep(state, ops);
+  applyOpsAtStep(model, state, ops);
   integrate(config, state);
   satisfyConstraints(config, model, state);
   collideGround(config, state);
@@ -208,9 +322,11 @@ function integrate(config: ClothConfig, state: ClothState): void {
 
 /**
  * 固定迭代次数的位置型约束（Jakobsen）松弛。
- * 每次迭代先扫全部水平边、再扫全部垂直边，顺序固定。
+ * 每次迭代先扫全部水平边、再扫全部垂直边，最后按创建顺序扫补缝缝线，
+ * 顺序固定 —— 缝线的稳定扫描位置在全部原始边之后，与建模无关的运行时
+ * 追加因此仍然确定（同一日志的一次推进 / 分批推进 / 重放逐位一致）。
  * 边首次检测到 strain > tearFactor 时标记撕裂（只撕裂一次），
- * 此后所有步骤直接跳过，不再施加该边约束。
+ * 此后所有步骤直接跳过，不再施加该边约束。缝线按同一阈值断裂。
  */
 export function satisfyConstraints(
   config: ClothConfig,
@@ -219,7 +335,7 @@ export function satisfyConstraints(
 ): void {
   const { iterations, stiffness, tearFactor } = config;
   const { edgeA, edgeB, edgeRest, edgeHorizontal, edgeCount } = model;
-  const { pos, prev, pinned, torn } = state;
+  const { pos, prev, pinned, torn, seams } = state;
 
   // edgeHorizontal 只有 0/1 两种值，天然分成水平段在前、垂直段在后。
   for (let it = 0; it < iterations; it++) {
@@ -260,6 +376,37 @@ export function satisfyConstraints(
         pos[ib] -= dx * cb;
         pos[ib + 1] -= dy * cb;
       }
+    }
+
+    // 补缝缝线：固定排在原始边之后，按创建顺序（id 升序）扫描。
+    // 撕裂阈值与原边相同；断裂后同样永久跳过。
+    for (let k = 0; k < seams.length; k++) {
+      const sm = seams[k];
+      if (sm.torn) continue;
+      const ia = sm.a * 2;
+      const ib = sm.b * 2;
+      const dx = pos[ib] - pos[ia];
+      const dy = pos[ib + 1] - pos[ia + 1];
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      if (dist > sm.rest * tearFactor) {
+        sm.torn = true; // 缝线断裂同样不可逆
+        continue;
+      }
+      if (dist === 0) continue;
+
+      const wa = pinned[sm.a] ? 0 : 1;
+      const wb = pinned[sm.b] ? 0 : 1;
+      const wsum = wa + wb;
+      if (wsum === 0) continue;
+
+      const m = ((dist - sm.rest) / dist) * stiffness;
+      const ca = m * (wa / wsum);
+      const cb = m * (wb / wsum);
+      pos[ia] += dx * ca;
+      pos[ia + 1] += dy * ca;
+      pos[ib] -= dx * cb;
+      pos[ib + 1] -= dy * cb;
     }
   }
   // prev 不随约束修正改变 —— Verlet 速度（pos-prev）自然吸收约束冲量。

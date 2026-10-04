@@ -6,10 +6,13 @@ interface Props {
   config: ClothConfig;
   snapshot: Snapshot | null;
   playing: boolean;
+  mendMode: boolean;
+  mendError: string | null;
   onApplyConfig: (cfg: ClothConfig) => void;
   onTogglePlay: () => void;
   onStep: (count: number) => void;
   onReset: () => void;
+  onSetMendMode: (on: boolean) => void;
 }
 
 const numberField = (
@@ -39,10 +42,13 @@ export function ControlPanel({
   config,
   snapshot,
   playing,
+  mendMode,
+  mendError,
   onApplyConfig,
   onTogglePlay,
   onStep,
   onReset,
+  onSetMendMode,
 }: Props) {
   const [draft, setDraft] = useState<ClothConfig>(config);
   const [batch, setBatch] = useState(10);
@@ -97,8 +103,24 @@ export function ControlPanel({
         />
         <button onClick={onReset}>↺ 重置</button>
       </div>
+      <div className="row">
+        <button
+          className={mendMode ? 'primary' : ''}
+          onClick={() => onSetMendMode(!mendMode)}
+          disabled={reachedMax}
+        >
+          {mendMode ? '🪡 补缝模式：开' : '🪡 补缝模式'}
+        </button>
+        {mendMode && (
+          <span className="hint" style={{ margin: 0 }}>
+            依次点击一条已撕裂边的两个端点
+          </span>
+        )}
+      </div>
+      {mendError && <p className="mend-error">✘ {mendError}</p>}
       <p className="hint">
         提示：单步 +1 连续点 600 次与「推进 N 步」分批推进，结果逐位一致。
+        补缝会在下一次积分前生成新缝线（静长取两端当前距离），旧撕裂边保留作取证轨迹。
       </p>
 
       <h3>布料与约束参数</h3>

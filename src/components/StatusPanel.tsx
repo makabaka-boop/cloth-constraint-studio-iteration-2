@@ -37,6 +37,10 @@ export function StatusPanel({ snapshot, hoveredNode, report, busy, onRunChecks }
             <Stat label="撕裂边" value={snapshot.tornCount} />
             <Stat label="操作数" value={snapshot.ops.length} />
           </div>
+          <div className="stat-row">
+            <Stat label="活动缝线" value={snapshot.activeSeamCount} />
+            <Stat label="累计补缝" value={snapshot.seams.length} />
+          </div>
           <div className="progress">
             <div
               className="progress-bar"
@@ -57,6 +61,34 @@ export function StatusPanel({ snapshot, hoveredNode, report, busy, onRunChecks }
             </table>
           ) : (
             <p className="hint">将鼠标悬停到任意节点上查看其逐帧状态。</p>
+          )}
+
+          {snapshot.seams.length > 0 && (
+            <>
+              <h4>补缝缝线（含代次）</h4>
+              <table className="kv">
+                <thead>
+                  <tr>
+                    <td>id</td><td>端点</td><td>代次</td><td>静长</td><td>状态</td>
+                  </tr>
+                </thead>
+                <tbody>
+                  {snapshot.seams.map((sm) => (
+                    <tr key={sm.id}>
+                      <td>#{sm.id}</td>
+                      <td>{sm.a}↔{sm.b}</td>
+                      <td>第 {sm.generation} 次</td>
+                      <td>{fmt(sm.restLength)}</td>
+                      <td>
+                        {sm.torn
+                          ? '已断裂'
+                          : `活动${sm.strain !== null ? ` · 应变 ${fmt(sm.strain)}` : ''}`}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
           )}
 
           <h4>自动化不变量核对</h4>
@@ -88,6 +120,7 @@ const LABELS: Record<string, string> = {
   fixedNoDrift: '固定点不漂移',
   ground: '地面边界',
   tearMonotonic: '撕裂不可逆',
+  seamIntegrity: '缝线身份与断裂不可逆',
   determinism: '分批推进一致',
   pinSemantics: '固定/释放语义',
   cap: '600 步上限',
